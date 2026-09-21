@@ -48,7 +48,7 @@ Useful options:
 | --- | --- |
 | `-o, --output PATH` | Output file or folder (created if missing). |
 | `--encoding ENC` | `cp932` (default, the usual convention), `utf-8`, `utf-8-sig`. |
-| `--course NAME` | Force `Easy / Normal / Hard / Oni / Edit` (otherwise inferred from the difficulty name). |
+| `--course NAME` | Force `Easy / Normal / Hard / Oni / Inner Oni` (otherwise inferred from the difficulty name). |
 | `--level N` | Force the `LEVEL` value. |
 | `--barline MODE` | `auto` (default, follows osu's omit-bar-line flag), `show`, `hide`. |
 | `--subdiv N` | Base cells per beat (default `4`); raised automatically when notes need it. |
