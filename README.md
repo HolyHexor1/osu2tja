@@ -86,7 +86,7 @@ in this repository.
 
 ## Author
 
-TakanashiR
+TakanashiR — [github.com/HolyHexor1](https://github.com/HolyHexor1)
 
 ## License
 
@@ -112,4 +112,4 @@ osu!taiko 谱面（`.osu`，`Mode: 1`）→ 本家 TJA 谱面转换器，面向 
 - 本仓库**不包含任何谱面与音频**，请勿用它再分发他人的谱面或歌曲。
 - `OFFSET` 的写法沿用早先那个 `osu2tja` 转换器的约定（偏移 = 减去首个计时点或首个音符的位置）。
   这里只借鉴了思路，**没有**收录那个项目的代码。
-- 作者：TakanashiR
+- 作者：TakanashiR（GitHub: [HolyHexor1](https://github.com/HolyHexor1)）
