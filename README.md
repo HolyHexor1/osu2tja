@@ -1,7 +1,7 @@
 # osu2tja
 
 Convert **osu!taiko** beatmaps (`.osu`, `Mode: 1`) into **Taiko TJA** charts, for simulators such as
-**OpenTaiko / OpenTycho / TaikoJiro**.
+**OpenTaiko / TaikoJiro**.
 
 It aims for a faithful conversion, not a lossy one: note types, note timings, BPM changes and
 scroll speed (SV) are reconstructed on a clean TJA grid instead of dumping raw milliseconds
