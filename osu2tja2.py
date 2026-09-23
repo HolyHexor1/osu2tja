@@ -617,7 +617,26 @@ def _note_collapse(positions, n, cell):
 #      (实测 95ms, 与 11/36 只差 0.009ms)。有了 36, LCM(4, 6, 9, 36) = 36, 一格全收。
 #    表里同时保留 24/32/48(它们对应更细的合法档); 因为现在按**从粗到细**试且容差很紧
 #    (见 GAP_TOL_MS), 它们不会再抢走本该属于粗档的间隔。
-GAP_SUBDIV = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 36, 48)
+#
+# ⚠⚠ 2026-09-23 第四轮修 bug (Fellsius - Talk 17.2s 用户报) 补进 **35** —— 这是「接缝分母」:
+#    **两群不同节奏型在同一拍里相遇时, 中间那一下间隔 = 两个「好分数」之差**,
+#    它的分母**不在**上面那套「1/n」里, 而且**可以无限生成**, 逐个塞是塞不完的。
+#    用户那首 (BeatDivisor=7) 的动机就是 `1/7 1/7 1/7 | 6/35 | 1/5 1/5`, 合计正好 1 拍:
+#        3/7 + 6/35 + 2/5 = 15/35 + 6/35 + 14/35 = 35/35 ✓
+#    6/35 = 1/5 − 1/7×... 即「1/7 群与 1/5 群的接缝」。82ms 实测:
+#        · 6/35 (真值) 误差 **0.37ms**  · 1/6 误差 2.63ms  · 5/48 误差 8.9ms
+#    表里没有 35 → 紧容差(1ms)整表判不出 → 落进兜底容差(3ms), 被**最粗**的 1/6 抢走。
+#    后果不只是「名字错」: 分母集合从 {7,5,2,18} 变成 {6,7,5,2,18}, 最小公倍从 630 变成
+#    630(不变), 但 `choose_grid` 的打分里「能整除的档数」变了 —— 实测该小节最终 D 被推到
+#    **378 (1512 格/小节)**, 而正确识别后是 **70 (280 格)**, 整小节白白放大 5.4 倍,
+#    且 1/5 与 6/35 都落不到整数格上。
+#
+# ⚠ **35 必须排在 36 之后**(这是本表唯一一处不按升序排列, 刻意的):
+#    1/35 = 0.028571 与 1/36 = 0.027778 只差 0.00079 拍(**0.38ms**), 在 1ms 容差里
+#    两者会互相冒充。而 1/36 是**真节奏型**(跨拍尾巴 11/36、13/36 用得到), 1/35 只在
+#    「接缝」里以 6/35、11/35 这类**多分子**形式出现(那与任何 k/36 都差很远, 不会撞)。
+#    所以要**先试 36 再试 35** —— 反过来会把所有真 1/36 间隔判成 1/35(实测 VIGVANGS)。
+GAP_SUBDIV = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 36, 35, 48)
 
 # 「判节奏型」用的容差(毫秒)。**必须比「摆放音符」的容差(note_tol_ms=3ms)紧**:
 #   摆放时允许把音符吸到最近格(3ms 听不出来), 但**判定它属于哪种节奏型必须接近精确** ——
@@ -732,18 +751,81 @@ def _bar_subdiv(note_pos, msb: float, tol_beats: float, length: float = 0.0,
         if v is None:
             v = _identify(gap, tol_beats)       # 判不出就退回摆放容差(3ms)
         vals.append(v)
-    dens = {v.denominator for v in vals if v is not None}
+    dens_all = {v.denominator for v in vals if v is not None}
+    if not dens_all:
+        return None
+
+    # ★★ 第五轮 (2026-09-23): 「孤立 + 不在接缝上」的细档先降级, 不配抬高格宽下限。
+    #
+    #   背景: 补进 35 之后 (BUZZ CUTZ t=374315.5, msb=310.881ms) 出现一个 79ms 间隔 ——
+    #     真值 1/4 = 77.72ms(差 1.28ms), 被判成 9/35(差 0.94ms), 只赢 **0.34ms**。
+    #     可就为这 0.34ms, `ideal` 从 4 抬到 140, 该小节格数 **16 → 560**(放大 35 倍)。
+    #     而该小节通篇都是 ±1ms 的量化噪声: 1/2 写成 155/156, 1/4 写成 77/78/79/77/78。
+    #     那个 79 只是噪声里最偏的样本, **不是节奏型** —— 真接缝两侧必须是不同的细分,
+    #     而它两边都是 1/4。 ⇒ 用户口径是「绝对时刻差得少不算还原, 等距关系才算」,
+    #     那么反过来: **为 0.34ms 多付 35 倍格子同样不算还原, 是虚胖**。
+    #
+    #   判据(「它到底是不是一种节奏型」的结构性定义, 与用户否掉的「多数决」无关):
+    #     ① **多次出现** —— 同一分数在本小节出现 ≥2 次 ⇒ 是一条真的拍型, 保留。
+    #        (Talk 的 6/35 出现 3 次, 靠这条安全留下。)
+    #     ② **真接缝** —— 相邻两个间隔判成了**不同**的分数(细分在变), 中间那一下才可能
+    #        是接缝, 保留。 (11/36 这类跨拍尾巴同理。)
+    #     ③ 其余 = 孤立 + 两侧同型 ⇒ 先剔除, 当作「相邻那种粗档被量化抖了一下的样本」。
+    #
+    #   ⚠ 剔除后**必须复验**: 若该间隔的终点音符在粗格上会偏离 > tol_beats(3ms),
+    #     说明它其实非细不可(例如 1/5 夹在一堆 1/4 中间, 差 15.5ms), 立刻把分母收回来。
+    #   ⚠ 过滤版若取不出解, 就退回未过滤的版本 —— 保证**绝不比改动前更差**。
+    freq = {}
+    for v in vals:
+        if v is not None:
+            freq[v] = freq.get(v, 0) + 1
+    keep = set()
+    for i, v in enumerate(vals):
+        if v is None:
+            continue
+        if freq[v] >= 2:
+            keep.add(v)
+            continue
+        l = vals[i - 1] if i > 0 else None
+        r = vals[i + 1] if i + 1 < len(vals) else None
+        if l is None or r is None:
+            # 小节首/尾的间隔只有一个邻居, 判不了「是不是接缝」-> 保守留下, 不动它。
+            keep.add(v)
+            continue
+        if l != r:
+            keep.add(v)             # 真接缝: 两侧细分不同
+    # (未进 keep 的 = 夹在同型跑动中间 + 孤立 => 视为「那串跑动被量化抖了一下的样本」)
+
+    def _lcm(ds):
+        m = 1
+        for d in sorted(ds):
+            m = m * d // math.gcd(m, d)
+        return m
+
+    while True:
+        cur = {v.denominator for v in vals if v is not None and v in keep}
+        if not cur:
+            keep = {v for v in vals if v is not None}
+            break
+        d0 = max(_lcm(cur), base)
+        n0 = int(round(d0 * length))
+        if n0 < 1:
+            n0 = 1
+        cell0 = length / n0
+        restore = None
+        for i, v in enumerate(vals):
+            if v is None or v in keep:
+                continue
+            p = note_pos[i + 1]
+            if abs(p - round(p / cell0) * cell0) > tol_beats:
+                restore = v
+                break
+        if restore is None:
+            break
+        keep.add(restore)
+    dens = {v.denominator for v in vals if v is not None and v in keep}
     if not dens:
-        return None
-
-    ideal = 1
-    for n in sorted(dens):
-        ideal = ideal * n // math.gcd(ideal, n)
-
-    cap = int(GRID_CAP_CELLS / length)
-    hi = min(cap, max(ideal, base))
-    if hi < 1:
-        return None
+        dens = dens_all
 
     # 逐个候选格宽真的摆一遍, 打分 = (破坏等距次数 bad, −能精确表达的节奏型档数)。取最小。
     # ★ 为什么第二项是「精确档数」而不是「偏差最小」或「格数最少」:
@@ -753,41 +835,60 @@ def _bar_subdiv(note_pos, msb: float, tol_beats: float, length: float = 0.0,
     #     所以理想可行时它必然胜出(和上一轮口径完全一致); 理想不可行时, 它退而求
     #     「能整除尽量多节奏型」的自然折中, 落点也总是某个子集的最小公倍, 有结构。
     #   · 同样好时取**最粗**(格数最少) —— 格子只在谱面里看不见地占位, 少比多好。
-    best = None
-    for D in range(hi, 0, -1):
-        n = int(round(D * length))
-        if n < 1:
-            continue
-        cell = length / n
-        worst = 0.0
-        prev = None
-        ks = []
-        ok = True
-        for p in note_pos:
-            i = int(round(p / cell))
-            i = 0 if i < 0 else (n if i > n else i)
-            e = abs(p - i * cell)
-            if e > worst:
-                worst = e
-            if prev is not None and i == prev:
-                ok = False       # 音符撞格 -> 会被覆盖吃掉, P0-a, 直接淘汰
-                break
-            prev = i
-            ks.append(i)
-        if not ok or worst > tol_beats:
-            continue
-        bad = 0
-        for j in range(len(vals) - 1):
-            if vals[j] is not None and vals[j] == vals[j + 1] \
-                    and ks[j + 1] - ks[j] != ks[j + 2] - ks[j + 1]:
-                bad += 1
-        if bad == 0 and D == ideal:
-            return D            # 理想格宽本身就能保证等距 -> 直接用它(绝大多数小节走这里)
-        exact = sum(1 for d in dens if D % d == 0)
-        key = (bad, -exact)
-        if best is None or key <= best[0]:
-            best = (key, D)
-    return best[1] if best is not None else None
+    def _solve(dens_ideal, dens_score):
+        """给定分母集合, 逐个候选格宽真的摆一遍, 取最优 D(取不出返回 None)。
+
+        ⚠ `dens_ideal` 只用来定**上限** `hi`(哪些细档值得为它加密);
+          `dens_score` 用来算「能精确整除的档数」这个打分项。
+          两者分开是刻意的: 过滤只该体现在**「不配把格宽往上抬」**这一件事上,
+          不该顺带改掉排序口径 —— 否则一个末尾的孤立细档会连带把别的小节的
+          最优 D 换掉(实测 BUZZ t=284781.8 的 132 会变成 77)。
+        """
+        ideal = _lcm(dens_ideal)
+        cap = int(GRID_CAP_CELLS / length)
+        hi = min(cap, max(ideal, base))
+        if hi < 1:
+            return None
+        best = None
+        for D in range(hi, 0, -1):
+            n = int(round(D * length))
+            if n < 1:
+                continue
+            cell = length / n
+            worst = 0.0
+            prev = None
+            ks = []
+            ok = True
+            for p in note_pos:
+                i = int(round(p / cell))
+                i = 0 if i < 0 else (n if i > n else i)
+                e = abs(p - i * cell)
+                if e > worst:
+                    worst = e
+                if prev is not None and i == prev:
+                    ok = False       # 音符撞格 -> 会被覆盖吃掉, P0-a, 直接淘汰
+                    break
+                prev = i
+                ks.append(i)
+            if not ok or worst > tol_beats:
+                continue
+            bad = 0
+            for j in range(len(vals) - 1):
+                if vals[j] is not None and vals[j] == vals[j + 1] \
+                        and ks[j + 1] - ks[j] != ks[j + 2] - ks[j + 1]:
+                    bad += 1
+            if bad == 0 and D == ideal:
+                return D            # 理想格宽本身就能保证等距 -> 直接用它(绝大多数小节走这里)
+            exact = sum(1 for d in dens_score if D % d == 0)
+            key = (bad, -exact)
+            if best is None or key <= best[0]:
+                best = (key, D)
+        return best[1] if best is not None else None
+
+    D = _solve(dens, dens_all)
+    if D is None and dens != dens_all:
+        D = _solve(dens_all, dens_all)      # 过滤版取不出解 -> 退回原口径, 绝不更差
+    return D
 
 
 def choose_grid(length: float, note_pos, cmd_pos, msb: float, base: int = 4,
