@@ -140,8 +140,13 @@ def beats_to_measure(beats: float):
 #   round() 把每段的取整噪声就地吃掉, 误差只在"这一段"里(毫秒量级), **不逐段累积**。
 #   反面做法是"只改声明出来的小节长、不改红线自身位置"(旧 `--measure-snap`): 声明与
 #   真实不符, 每段欠一点点, 几十段就累积成十几毫秒的整体漂移 —— 那正是被废弃的原因。
-GRID_UNITS = (Fraction(1, 4), Fraction(1, 3), Fraction(1, 6),
-              Fraction(1, 8), Fraction(1, 12), Fraction(1, 16))
+# ⚠ 顺序**有意义**: 链式还原按顺序试, 第一个能在 12ms 内命中的单位就被采用。
+#   所以粗的单位必须排在前面 —— 一条本来就在 1/4 拍网格上的红线, 要优先被 1/4 接走,
+#   而不是被某个更细的单位「以更小的 k」抢走(那会把它挪到别处, 并让下游整条链跟着平移)。
+#   1/5、1/7(用户 2026-09-22 要求): 五连音 / 七连音段落的小节边界。
+#   它们排在 1/3、1/6 之后、1/12 之前 —— 比 1/4 细, 但不是最细的兜底档。
+GRID_UNITS = (Fraction(1, 4), Fraction(1, 3), Fraction(1, 6), Fraction(1, 5),
+              Fraction(1, 7), Fraction(1, 8), Fraction(1, 12), Fraction(1, 16))
 GRID_TOL_MS = 12.0      # 偏差超过这个数就不吸(认定原谱真的不在网格上, 比如花式变速)
 DUP_RED_MS = 5.0        # 相邻红线只差这么点 -> 视为同一条(osu 编辑残留)
 
@@ -152,8 +157,9 @@ def restore_red_grid(reds, units=GRID_UNITS, tol_ms: float = GRID_TOL_MS,
 
     reds 需已按时间排序。第一条红线不动 —— 它是谱面起点, 决定 OFFSET。
 
-    单位从 1/4 拍起试(本家最常用), 吸不下再退到 1/3、1/6、1/8、1/12、1/16 拍
-    (三连音/更细的网格)。偏差超过 tol_ms 就整段不动, 免得把花式变速掰弯。
+    单位从 1/4 拍起试(本家最常用), 吸不下再退到 1/3、1/6、1/5、1/7、1/8、1/12、1/16 拍
+    (三连音/五连音/七连音/更细的网格), 顺序见 GRID_UNITS 上方的说明。
+    偏差超过 tol_ms 就整段不动, 免得把花式变速掰弯。
 
     与上一条只差几毫秒的红线(如 Nivalis 的 `257 -> (2ms) -> 32.125`)属于 osu 编辑
     残留: **丢掉前一条、后一条继承它的位置**, 这样真正的变速(后者)不会因为丢掉前者
@@ -407,7 +413,20 @@ def parse_osu(path: str, red_grid: bool = True):
 # 实测 8 首本家 TJA、1113 个小节里只出现过 1/2/3/4/6/8/12/16/24 这些值
 # (其中「每拍 4 格」占 692 个), 从没有「为了摆一条命令点把整行加密几十倍」的写法。
 # 旧版按需升到 96/192 格, 结果同一串 1/6 音符在不同行里疏密差 16 倍, 预览完全不像原谱。
-NICE_SUBDIV = (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 192, 384)
+#
+# 5 与 7(用户 2026-09-22 要求加入): 五连音 / 七连音在 osu 与太鼓里都极罕见, 但确实存在。
+#   ⚠ 这是「音符的档位」—— 只决定音符落在哪一格。命令点(SV)不参与选档位,
+#     见 choose_grid() 里「① 只用音符选档位」那一步。加这两档的代价只是「多试一次」: 落不下就跳过。
+#   为什么不加 9/11/13: 九连音以上基本是「导出成 1/12 拍也能听出来」的量级, 且本家从不写。
+NICE_SUBDIV = (4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64, 96, 192, 384)
+
+# 「命令点可以借用的额外格宽」上限。命令点(SV/GOGO)的换值时刻允许被吸到最近的格上,
+# 而不是逼着整个小节加密 —— 因为 SV 在谱面上不可见, 只影响它之后音符的流速(P1)。
+# ⚠ 这里给的是**倍数**: 音符选出的格宽 cell 最多可以再细 CMD_EXTRA_FACTOR 倍去找一个
+#   容纳命令点的档位; 再找不到就直接吸到最近的格, 不再加密。
+#   实测(ON.UR.MARKS): 旧口径为了命令点精确落格, 总格数 13602 -> 32162(2.4 倍),
+#   而按用户的验收次序, 这些格子在游戏里看不见 —— 不值得。
+CMD_EXTRA_FACTOR = 2
 
 # 命令点(SCROLL/GOGO)的落格容差, 单位毫秒。
 # 旧值 30ms 会把命令点吸到「它所影响的音符那一格」之后 —— 实测 ON.UR.MARKS 有
@@ -524,6 +543,33 @@ def _grid_fits(positions, n, cell, tol):
     return True
 
 
+def _cmd_collapse(positions, n, cell, tol):
+    """命令点在格宽 cell 下会有几条「挤进同一格」? 返回冲突数(0 = 全都能各占一格)。
+
+    ★ 这是 P1 流速还原的**真正判据** —— 比「落格偏差」要紧得多。
+    因为 `convert()` 铺格时同一格的多条命令**只有最后一条存活**(前面的被覆盖),
+    一条被覆盖的 `#SCROLL` 意味着**它影响的那段音符全部用错流速**。
+    实测(ON.UR.MARKS)被覆盖处出现过差 0.75~1.0(即流速整体错一倍)的音符。
+
+    同时要求 round() 后的偏差不超过 tol: 偏差太大说明这条命令被吸到了别的变速区间,
+    前后关系可能跨过音符。
+
+    positions 单位: 拍。tol 单位: 拍。
+    """
+    conflict = 0
+    prev_i = None
+    for p in positions:
+        i = int(round(p / cell))
+        i = 0 if i < 0 else (n if i > n else i)
+        if abs(p - i * cell) > tol:
+            conflict += 1
+            continue
+        if i == prev_i:
+            conflict += 1
+        prev_i = i
+    return conflict
+
+
 def _grid_worst_err(positions, n, cell):
     """把 positions 吸到 0..n 号格点上之后的最大误差(单位同 cell)。"""
     worst = 0.0
@@ -534,10 +580,233 @@ def _grid_worst_err(positions, n, cell):
     return worst
 
 
+def _note_collapse(positions, n, cell):
+    """有几个音符会因为「挤进同一格」而被吃掉? 返回冲突数(0 = 每个音符各占一格)。
+
+    ★ 这是**比落格偏差更硬的约束**: `convert()` 铺格时是 `slots[i] = ch` 的**覆盖**
+    写法, 两个音符落进同一格 → 前一个**直接从谱面上消失**。那就是 P0-a (音符数目)
+    出错, 用户的第一条红线, 绝对不可以。
+
+    (同类问题在命令点上叫 `_cmd_collapse`, 但后果不同: 命令被吃掉丢的是流速(P1),
+     音符被吃掉丢的是音符本身(P0)。所以这里的判据必须更严 —— 只按「格号是否相同」
+     判定, 不看偏差。)
+    """
+    seen = set()
+    conflict = 0
+    for p in positions:
+        i = int(round(p / cell))
+        i = 0 if i < 0 else (n if i > n else i)
+        if i in seen:
+            conflict += 1
+        seen.add(i)
+    return conflict
+
+
+# 「常见节奏型」= 每拍格数。1 = 整拍一下, 2 = 半拍, 3 = 三连, 4 = 十六分, 5 = 五连…
+# ★★ 这张表是用来**判定「这个音符属于哪种节奏型」**的, 与 NICE_SUBDIV
+#    (**挑格宽**的候选表)是两件事, 千万别混。
+#    判定表里 **1/5 与 1/4 地位完全平等** —— 用户 2026-09-23 拍板:
+#    「上一个是 1/4, 下一个还是有可能是 1/5, 并不是说音符之间就一定是经常等距的」。
+#    1/7 同理(只是更少见)。谁出现就谁留格子, 谁多谁少都不该影响判定。
+# ⚠⚠ 2026-09-23 第二轮修 bug (BUZZ CUTZ 7:33 用户报) 补进 **9 与 36**:
+#    - **9**: osu 编辑器的吸附档位本来就有 1/9。原表缺它 → 一个 34ms(≈1/9 拍)的间隔
+#      全表最强命中变成了 **5/48**(误差 1.6ms), 于是 34/35/69ms 被判成 5/48、7/32,
+#      最小公倍被抬到 96, 整小节被无谓加密 2.7 倍。补 9 之后它们立刻回到 1/9、2/9。
+#    - **36**: 跨拍型留下的「尾巴」需要它。例: 一小组音符按 1/9 摆(1/9、2/9),
+#      末音落在 1/4 网格点上(3/4 拍), 于是最后一段间隔 = 3/4 − 4/9 = **11/36 拍**
+#      (实测 95ms, 与 11/36 只差 0.009ms)。有了 36, LCM(4, 6, 9, 36) = 36, 一格全收。
+#    表里同时保留 24/32/48(它们对应更细的合法档); 因为现在按**从粗到细**试且容差很紧
+#    (见 GAP_TOL_MS), 它们不会再抢走本该属于粗档的间隔。
+GAP_SUBDIV = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 36, 48)
+
+# 「判节奏型」用的容差(毫秒)。**必须比「摆放音符」的容差(note_tol_ms=3ms)紧**:
+#   摆放时允许把音符吸到最近格(3ms 听不出来), 但**判定它属于哪种节奏型必须接近精确** ——
+#   否则细档会靠「巧合命中」赢过粗档。踩过的坑:
+#     · 34ms 被 5/48 命中(误差 1.62ms) → 本该是 1/9(误差 0.54ms);
+#     · 69ms 被 7/32 命中(误差 0.99ms) → 本该是 2/9(误差 0.086ms);
+#     · 95ms 被 5/16 命中(误差 2.15ms) → 本该是 11/36(误差 0.009ms)。
+#   容差收到 1.0ms 后, 上面三个全部回到正确档位。
+GAP_TOL_MS = 1.0
+
+# 「判出来的最小公倍」允许有多细: 上限 = 本小节总格数不超过 GRID_CAP_CELLS。
+#   ★ 取 1536 是**和 `rebuild.py` 的排版体检口径对齐**(本家语料最密的一小节就是 1560 格),
+#     两边不一致的话 rebuild 会把刚生成的谱面判失败。
+#   旧上限是 `int(1/tol_beats)`(=193BPM 下只有 103), **把合法的 LCM 也挡掉了**:
+#     · 1/4+1/6+1/9        → LCM = 36    (旧上限 103 放行, 没问题)
+#     · 1/4+1/5+1/6+1/9    → LCM = 180   (旧上限 103 **挡住** → need=None → 回退到坏格宽)
+#     · 1/4+1/5+1/6+1/8+1/9→ LCM = 360   (同上, 挡住)
+#   被挡住后的回退结果正是用户报的「不等距」: 1/5 跑动写成 13/13/12/13/13、
+#   1/6 跑动写成 11/10/11。所以上限必须放到能容下 360。
+#   仍然挡掉真正病态的 LCM(504、720、3360…), 那些回退到老候选表。
+GRID_CAP_CELLS = 1536
+
+# ★★ 「最小公倍」还不够 —— 必须再验一次「等距到底有没有成立」。
+#   (2026-09-23 第三轮, BUZZ CUTZ 7:33 那个混了 1/3/1/4/1/8/1/5 的小节报的 bug)
+#
+#   **病症**: 最小公倍**算对了**, 音符也都在 3ms 内, 但同一串本该等距的音符被写成不等距。
+#   **病因**: 铺格是 `i = int(round(p / cell))`, 而 osu 的时刻只有整数毫秒 —— 同一个 1/5
+#   跑动的相邻间隔实测在 62/63ms 之间抖 1ms。格宽一旦细到「1ms 抖动能跨过半格」,
+#   这串音符就会写出不同的格子数。实测(BUZZ CUTZ, msb=310.88ms):
+#     · D=360(一格 0.86ms) → 1/5 跑动 = 72,73,72,72,71        ✗
+#     · D=180(一格 1.73ms) → 1/9 跑动 = 19,21                 ✗
+#     · D=120(一格 2.59ms) → 1/5 = 24×5、1/9 = 13,13          ✓
+#   ⇒ 格宽 **不能只看「能不能整除」, 还要看「整除之后格子数稳不稳」**。
+#
+#   **判据**(取代原来的「格宽不许细过 4ms」这个拍脑袋常数):
+#     ① 把每个间隔判成**约分后的分数**(2/9 与 1/9 是两种节奏型, 不能混为一谈);
+#     ② 对候选格宽 D, 数出**「同型相邻间隔格子数不等」的次数** `bad`
+#        (「同型」= 两个相邻间隔判成了同一个分数);
+#     ③ 候选范围 `D ≤ min(GRID_CAP_CELLS/length, max(ideal, base))` ——
+#        **绝不需要比「所有节奏型的最小公倍 ideal」还细**, 更细只会让抖动更容易跨格;
+#     ④ 打分 = (`bad` ↓, 能**整除**的节奏型档数 ↑, 格宽 ↓) —— 取最优。
+#        第二项是「最小公倍」的推广: 理想格宽能整除所有节奏型, 所以理想可行时它必然胜出;
+#        理想不可行时退而求「能整除尽量多节奏型」, 落点仍是某个子集的最小公倍, 有结构。
+#   ⇒ `bad=0` 的含义就是「每一串同型音符在原谱里等距, 在 TJA 里也严格等距」。
+
+
+def _bar_subdiv(note_pos, msb: float, tol_beats: float, length: float = 0.0,
+                base: int = 4):
+    """给本小节挑一个「每拍格数 D」—— 判据是**让每一串同型音符严格等距**。
+
+    ★ 口径(用户 2026-09-22/23 两次拍板):
+      `choose_grid` 是「一个小节共用一个格宽」, 所以只要小节里同时出现 1/4 与 1/5,
+      格宽就必须**同时**容得下 1/4 拍与 1/5 拍 —— 最小的公共格是 **1/20 拍**,
+      也就是「每拍 20 格」。而老候选表 NICE_SUBDIV 里**恰好没有 20 这一档**,
+      逐档试过去只能上到 48, 于是 1/5 的等距被写成 8/48 与 10/48 交替
+      (绝对误差 ≤3ms 过得去, 但**相邻间隔不再相等**)。
+      这正是用户两次报的同一个问题: 「1/5 的 note 之间应该是等距的」。
+
+    ★ 为什么是「每个间隔独立判型」而不是「按主导拍型分段」:
+      分段会让多数派决定格宽、少数派被吸到最近格 —— 用户明确否掉了这条路:
+      「不能因为这个小节里 1/5 更多你就把它全部表达成 1/5」。
+      独立判型 + 逐候选打分, 相当于让 1/3、1/4、1/5、1/6、1/7 全都平权。
+
+    ★★ 为什么不是「算出最小公倍就完事」(2026-09-23 第三轮, BUZZ CUTZ 7:33 报的 bug):
+      最小公倍**算对了**也**可能摆错**。铺格是 `i = int(round(p / cell))`, 而 osu 的时刻
+      只有整数毫秒: 同一个 1/5 跑动的相邻间隔实测在 62/63ms 之间抖 1ms。格宽一旦细到
+      「1ms 抖动能跨过半格」, 这串音符就写出不同的格子数 —— 绝对时刻仍 ≤3ms(所以
+      「看着几乎一样」), 但**不再等距**。实测 D=360(一格 0.86ms) 让 1/5 写成
+      `72,73,72,72,71`、D=180 让 1/9 写成 `19,21`; D=120(一格 2.59ms) 才两者都对。
+      ⇒ 所以这里不再「算完就去用」, 而是**逐个候选真的摆一遍、数不等距的次数**, 取最好的。
+
+    判据(`bad` = 「同型相邻间隔格子数不等」的次数, 「同型」指两个相邻间隔判成了同一个分数):
+      ① `bad` 最小; ② 同样 `bad` 里能**整除**的节奏型档数最多; ③ 再同样就取**最粗**(格数最少)。
+      候选上限 `D ≤ min(GRID_CAP_CELLS/length, max(ideal, base))` ——
+      **绝不需要比「所有节奏型的最小公倍 ideal」还细**, 更细只会让抖动更容易跨格。
+      `ideal` 本身可行就直接返回它(绝大多数小节走这条快路, 与上一轮口径一致)。
+
+    返回 None = 「一个间隔都量不出节奏型」或「候选里没有能装下本小节音符的档」;
+    退回原来的逐档扫描(不会比改动前更差)。
+
+    ⚠ 判型容差用 `GAP_TOL_MS`(=1ms), **不是**调用方传进来的摆放容差(3ms) —— 见 GAP_TOL_MS。
+    ⚠ 判出来的东西必须**约分**: `2/9` 与 `1/9` 是两种节奏型, 混为一谈会让 `bad` 数错
+      (`2/9` 记成 9 就会把 `1/9,2/9` 当成「同型不等距」)。
+    """
+    if len(note_pos) < 2 or msb <= 0 or length <= 0:
+        return None
+    tol = min(tol_beats, GAP_TOL_MS / msb)
+
+    def _identify(gap, tolerance):
+        """把一个间隔量到**能容下它的最粗**那一档(从粗到细取第一个命中); 量不出返回 None。
+        这就是用户说的「把 1/3、1/4、1/5、1/6 甚至 1/7 带进去, 看它离哪个最近」的稳定版:
+        粗档先被考虑, 细档只有在前面的粗档都够不着时才可能赢。
+        ⚠ 容差只用**绝对毫秒**折成的拍数, 不能乘「间隔的百分比」—— 踩过的坑:
+          5/12 拍(0.4167) 与 2/5 拍(0.4) 只差 0.0167 拍, 若容差取「间隔 × 8%」,
+          5/12 就会被判成 1/5, 最小公倍从 12 抬到 60, 一整串小节跟着虚胖。
+          间隔的测量误差是**固定几毫秒**(osu 时刻是整数毫秒), 不随间隔长短缩放。
+        """
+        for n in GAP_SUBDIV:
+            k = int(gap * n + 0.5)      # 半拍向上取整, 避免 round(0.5) 的银行家舍入
+            if k < 1:
+                continue
+            if abs(gap - k / n) <= tolerance:
+                return Fraction(k, n)   # 约分: 2/9 与 1/9 必须区分开
+        return None
+
+    vals = []
+    for i in range(len(note_pos) - 1):
+        gap = note_pos[i + 1] - note_pos[i]
+        if gap <= 0:
+            return None
+        v = _identify(gap, tol)                 # 先用紧容差判
+        if v is None:
+            v = _identify(gap, tol_beats)       # 判不出就退回摆放容差(3ms)
+        vals.append(v)
+    dens = {v.denominator for v in vals if v is not None}
+    if not dens:
+        return None
+
+    ideal = 1
+    for n in sorted(dens):
+        ideal = ideal * n // math.gcd(ideal, n)
+
+    cap = int(GRID_CAP_CELLS / length)
+    hi = min(cap, max(ideal, base))
+    if hi < 1:
+        return None
+
+    # 逐个候选格宽真的摆一遍, 打分 = (破坏等距次数 bad, −能精确表达的节奏型档数)。取最小。
+    # ★ 为什么第二项是「精确档数」而不是「偏差最小」或「格数最少」:
+    #   · 「偏差最小」会一路挑到候选上限(格越细偏差越小), 把整曲格数撑大十倍 —— 试过, 不可用;
+    #   · 「格数最少」会挑到 55、65 这类毫无结构可言的格宽(bad=0 纯属巧合);
+    #   · 「精确档数」正好是「最小公倍」的推广: 理想格宽能整除**所有**节奏型, 档数最多,
+    #     所以理想可行时它必然胜出(和上一轮口径完全一致); 理想不可行时, 它退而求
+    #     「能整除尽量多节奏型」的自然折中, 落点也总是某个子集的最小公倍, 有结构。
+    #   · 同样好时取**最粗**(格数最少) —— 格子只在谱面里看不见地占位, 少比多好。
+    best = None
+    for D in range(hi, 0, -1):
+        n = int(round(D * length))
+        if n < 1:
+            continue
+        cell = length / n
+        worst = 0.0
+        prev = None
+        ks = []
+        ok = True
+        for p in note_pos:
+            i = int(round(p / cell))
+            i = 0 if i < 0 else (n if i > n else i)
+            e = abs(p - i * cell)
+            if e > worst:
+                worst = e
+            if prev is not None and i == prev:
+                ok = False       # 音符撞格 -> 会被覆盖吃掉, P0-a, 直接淘汰
+                break
+            prev = i
+            ks.append(i)
+        if not ok or worst > tol_beats:
+            continue
+        bad = 0
+        for j in range(len(vals) - 1):
+            if vals[j] is not None and vals[j] == vals[j + 1] \
+                    and ks[j + 1] - ks[j] != ks[j + 2] - ks[j + 1]:
+                bad += 1
+        if bad == 0 and D == ideal:
+            return D            # 理想格宽本身就能保证等距 -> 直接用它(绝大多数小节走这里)
+        exact = sum(1 for d in dens if D % d == 0)
+        key = (bad, -exact)
+        if best is None or key <= best[0]:
+            best = (key, D)
+    return best[1] if best is not None else None
+
+
 def choose_grid(length: float, note_pos, cmd_pos, msb: float, base: int = 4,
                 fuzzy_pos=(), note_tol_ms: float = 3.0, fuzzy_tol: float = 0.08,
                 cmd_tol_ms: float = CMD_TOL_MS):
     """给一个小节挑「每拍格数 D」和「总格数 N」。
+
+    选档位分三步:
+      ⓪ **先给本小节挑一个「节奏型都能严格等距」的格宽**(见 `_bar_subdiv`):
+         把每个间隔**各自独立**判成常见节奏型(判成约分后的分数), 再逐个候选格宽真的摆
+         一遍, 数「同型相邻间隔格子数不等」的次数 —— 取次数最少、且最细的那一档。
+         一个小节里同时有 1/4 与 1/5 时, 格宽会取到「每拍 20 格」, 两种节奏型**都落
+         整数格**, 谁都不用被牺牲。
+         (这正是 2026-09-22/23 用户两次报的那个 bug: 老候选表里没有 20 这一档。
+          第三轮又发现「最小公倍算对了也可能摆错」—— 见 `_bar_subdiv` 的 ★★ 段。)
+      ① **只用音符**(与连打/气球结束点)选出格宽 —— 它们是 P0。
+      ② 再看命令点(SV/GOGO)在这个格宽下是否**各自有格**(见 _cmd_collapse), 不够就
+         按 CMD_EXTRA_FACTOR 逐级放宽, 仍不够就认了 —— 宁可个别 SV 挤在一起,
+         也不再为它把音符的排版加密。
 
     D 从本家惯用的 4 开始试, 放不下再按 6/8/12/16/24... 依次加密; 只有在小节长度
     不是 1/4 拍整数倍时(红线被 osu 取整到整数毫秒的后果)才会退到 D<4 或非整数格。
@@ -552,16 +821,20 @@ def choose_grid(length: float, note_pos, cmd_pos, msb: float, base: int = 4,
       容差远小于半格, 所以绝不会出现「两个音符挤进同一格」。
 
     cmd_pos: SCROLL / GOGO 的**换值时刻**(单位: 拍)。
-      ⚠ 这里的容差**不能**像音符那样随便放宽。SV/HS 本身在谱面上不可见, 它唯一
-      的作用是决定**它之后那些音符的流速** —— 谱面上看得见的只有音符和小节线。
-      所以命令点必须和音符落在**同一张格子**上, 且相对音符的前后关系不能变。
-      实测(ON.UR.MARKS): osu 的绿线习惯性地写在**它所影响的音符之前 19~38ms**
-      (1/16~1/32 拍), 而那一小节的格宽是 150ms; 旧版用 30ms 容差, 于是 **749 个
-      命令点被吸到了「音符那一格」, 位置整整晚了 26ms**(= 落到了它所影响的音符
-      之后), 1430 个偏 >10ms, 逐音符「当时生效的 SCROLL」有 105 个和 osu 不一致。
-      收紧到 8ms 后: 偏 >10ms 的 0 个, 不一致的只剩 5 个, 而代价只是这一首的
-      总格数 13602 -> 19042(小节数、小节线、音符时刻**全部不变**)。
-      —— 换句话说: 加筋格只影响文字排版的疏密, 不影响游戏里看得见的任何东西。
+      ★ 2026-09-22 用户拍板改口径: **音符优先, 命令点松绑**。
+      旧口径要求「命令点和音符都必须各占一格」, 于是**只要有一条绿线落不进格子,
+      整个小节就被迫加密** —— 而 SV 在谱面上不可见, 只影响它之后音符的流速(用户验收
+      次序里的 P1), 拿音符的排版去换它是本末倒置。
+      新口径分两步:
+        ① 只用音符 + 连打/气球结束时刻选档位 (它们才是 P0, 决定音符落在哪一格);
+        ② 在这个格宽上再允许放宽 CMD_EXTRA_FACTOR 倍, 给命令点找位置;
+           仍放不下就**让命令点吸到最近的格** —— 宁可 SV 的生效时刻偏几个 ms。
+      代价与收益(实测 ON.UR.MARKS): 旧口径为了命令点精确落格, 总格数 13602 -> 32162
+      (2.4 倍); 这些多出来的格子游戏里看不见, 而 SV 只差几毫秒。所以新口径**同时**
+      让音符能表达 1/5、1/7 拍, 又不再让 SV 拖着整行加密。
+
+      注意「前后关系」仍然不许乱: 命令点只会被吸到**它自己那一格**, 不会跨过它所
+      影响的音符 —— 这是旧版 30ms 容差那个 bug 的教训(见 CMD_TOL_MS 上方注释)。
 
     fuzzy_pos: 连打/气球的**结束时刻**。它是按滑条长度算出来的, 本来就不在节拍网格上,
                所以用宽松容差(默认 0.08 拍), 免得它一个人把整行加密。
@@ -569,38 +842,110 @@ def choose_grid(length: float, note_pos, cmd_pos, msb: float, base: int = 4,
     nt = note_tol_ms / msb
     ft = fuzzy_tol
     ct = cmd_tol_ms / msb
-    order = [d for d in NICE_SUBDIV if d >= base] + \
-            [d for d in reversed(NICE_SUBDIV) if d < base]
-    for d in order:
-        n = int(round(d * length))
-        if n < 1:
-            continue
+    # ---- 候选格宽 ----
+    # 除了原来那张表, 再加一个「本小节节奏型都能严格等距」的格宽(见 _bar_subdiv)。
+    # ★ 该档**排在最前**: 只要算得出来就优先用它。
+    #   理由: 它已经**真的摆过一遍**、确认过每一串同型音符格子数相同; 而后面那些
+    #   候选只保证「音符落在 3ms 内」, 相邻间隔可能变成 10/9 交替 —— 也就是用户报的
+    #   「看起来很像、但不再等距」。所以在这个转换器里 **「等距」优先于「格数少」**
+    #   (用户 2026-09-22/23 两次拍板)。
+    #   算不出来时 need = None, 顺序与原来完全一致。
+    need = _bar_subdiv(note_pos, msb, nt, length, base)
+    if need is not None and need >= base:
+        pool = sorted(set(NICE_SUBDIV) | {need})
+        head = [d for d in pool if abs(d / need - round(d / need)) < 1e-9]
+        step = head + [d for d in pool if d not in head]
+    else:
+        step = sorted(NICE_SUBDIV)
+    step = [d for d in step if d >= base] + [d for d in reversed(step) if d < base]
+
+    def _pick(fit_pos, tol, also_pos=(), also_tol=0.0):
+        """在一张候选表上找出第一个能同时容纳 fit_pos 与 also_pos 的档位。
+
+        ⚠ **两组位置必须一起判**, 不能先挑再复核 —— 先找到的档位若容不下另一组,
+          复核失败会把人推进兜底分支(那里的起点是 NICE_SUBDIV[-1] × length,
+          实测直接把一个 4 拍小节撑到 1536 格)。这正是「先 `_pick(note)` 再查
+          fuzzy」写法踩出来的坑(vs.VIGVANGS 出现过一个 384 格/拍的小节)。
+        ⚠ **还要查 `_note_collapse`**: 铺格是 `slots[i] = ch` 的覆盖写法, 两个事件
+          落进同一格 → 前一个**从谱面上消失**(P0-a)。落格误差在容差内 ≠ 不会撞格。
+        """
+        for d in step:
+            n = int(round(d * length))
+            if n < 1:
+                continue
+            cell = length / n
+            if _grid_fits(fit_pos, n, cell, tol) and \
+                    _grid_fits(also_pos, n, cell, also_tol) and \
+                    not _note_collapse(list(fit_pos) + list(also_pos), n, cell):
+                return (d, n)
+        return None
+
+    # ---- ① 只用音符(与连打/气球结束点)选格宽: 「所有音符都落进同一张格网」 ----
+    # ★ 2026-09-23 起**不再有「按主导拍型分段」那一步**。用户否掉了它:
+    #   「不能因为这个小节里 1/5 更多你就把它全部表达成 1/5」。
+    #   现在的做法是让 ⓪ 的最小公倍档出场 —— 它能让 1/4 与 1/5 **同时**落在整数格上,
+    #   根本不需要谁让谁, 也就不存在「少数派被吸走」的取舍了。
+    chosen = _pick(note_pos, nt, fuzzy_pos, ft)
+
+    if chosen is None:
+        # 音符自己就放不下 -> 走兜底加密(原来那套逻辑, 只按音符判定)。
+        # ⚠ 硬上限照旧: 防病态小节撑到几万格。
+        tried = []
+        n = max(1, int(round(NICE_SUBDIV[-1] * length)))
+        while n <= FALLBACK_MAX_CELLS:
+            cell = length / n
+            if _grid_fits(note_pos, n, cell, nt) and _grid_fits(fuzzy_pos, n, cell, ft):
+                return (n / length if length else 1.0), n
+            tried.append(n)
+            n *= 2
+        best, best_n = None, tried[-1] if tried else 1
+        for cand in tried:
+            cell = length / cand
+            score = max(_grid_worst_err(note_pos, cand, cell) / nt if nt else 0.0,
+                        _grid_worst_err(fuzzy_pos, cand, cell) / ft if ft else 0.0)
+            if best is None or score < best:
+                best, best_n = score, cand
+        return (best_n / length if length else 1.0), best_n
+
+    d0, n0 = chosen
+    if not cmd_pos:
+        return d0, n0
+
+    # ---- ② 命令点: 先在同一格宽下试, 再按 CMD_EXTRA_FACTOR 逐级放宽 ----
+    # 判据在 _cmd_collapse(): **不许两条命令挤进同一格**(挤了 = 前一条被覆盖 =
+    # 它影响的那段音符全部用错流速; 实测有差 0.75~1.0 的大错)。
+    for n in (n0, n0 * CMD_EXTRA_FACTOR, n0 * CMD_EXTRA_FACTOR * 2):
         cell = length / n
-        if _grid_fits(note_pos, n, cell, nt) and _grid_fits(cmd_pos, n, cell, ct) \
-                and _grid_fits(fuzzy_pos, n, cell, ft):
-            return d, n
-    # 兜底(实测极罕见): 一路加密到放得下为止。
-    # ⚠ 必须有硬上限 —— 否则一个病态小节(比如命令点永远落在两个候选格的正中)
-    #   会把 N 翻倍到 10 万, 写出一个小节 10 万格的文件。到上限还不满足时,
-    #   退而求其次: 在所有试过的候选里挑「归一化最差误差最小」的那个。
-    tried = []
-    n = max(1, int(round(NICE_SUBDIV[-1] * length)))
-    while n <= FALLBACK_MAX_CELLS:
-        cell = length / n
-        if _grid_fits(note_pos, n, cell, nt) and _grid_fits(cmd_pos, n, cell, ct) \
-                and _grid_fits(fuzzy_pos, n, cell, ft):
+        if _cmd_collapse(cmd_pos, n, cell, ct) == 0:
             return (n / length if length else 1.0), n
-        tried.append(n)
-        n *= 2
-    best, best_n = None, tried[-1] if tried else 1
-    for cand in tried:
-        cell = length / cand
-        score = max(_grid_worst_err(note_pos, cand, cell) / nt if nt else 0.0,
-                    _grid_worst_err(cmd_pos, cand, cell) / ct if ct else 0.0,
-                    _grid_worst_err(fuzzy_pos, cand, cell) / ft if ft else 0.0)
-        if best is None or score < best:
-            best, best_n = score, cand
-    return (best_n / length if length else 1.0), best_n
+
+    # ---- ②b 上面三级都不行 -> 继续沿 **n0 的整数倍** 往上找 ----
+    # ⚠ 为什么必须有这一步(2026-09-22 实测踩坑):
+    #   ① 的「音符优先」会把格宽压到**音符自己够用**的最小档(典型 D=4),
+    #   而 SV 绿线常常比音符密得多 —— BUZZ CUTZ t=522.3s 那个 8 拍小节就是:
+    #   25 个音符只要 D=4 就全落网, 但 27 条绿线是按 0.2509 拍(=1/4 拍)排的,
+    #   在 D=4 的格上全部挤在 0.125 拍的位置上, 任何容差都放不下。
+    #   旧版(改动前)是「音符+命令一起选档」, 于是命令把 D 一路抬到 32 才通过;
+    #   改成「音符优先」之后, ② 只试到 4×n0 就放弃并**退回 D=4**,
+    #   把 27 条绿线压成几条 —— 逐音符生效流速就错了(实测差 1.0667)。
+    #   所以这里继续加密: 命令点需要多细就给多细。
+    # ⚠⚠ 但加密**只能取 n0 的整数倍**, 不能拿候选表里随便一个更细的档!
+    #   踩过的坑(2026-09-23 实测): ON.UR.MARKS t=225.5s 那一小节的音符只要 D=6 就
+    #   全部落网(1/3 与 1/6 拍), 可旧的 ②b 一路挑到了 **D=32** —— 32 **不是 6 的
+    #   整数倍**, 于是本该落在 1/3 拍(=8/24)的音符, 在 1/32 的格上只能落到
+    #   11/32 = 0.34375, 偏差 3.2~4.0ms(在 n0 格上只有 0.04ms)。
+    #   「加密只会让误差更小」**只在整数倍的前提下成立**: n0 的整数倍格网包含
+    #   原来的格点, 音符仍落在原来那一格上; 非整数倍则会把音符重新取整到别处。
+    k = CMD_EXTRA_FACTOR * 2 + 1
+    while n0 * k <= FALLBACK_MAX_CELLS:
+        n = n0 * k
+        cell = length / n
+        if _cmd_collapse(cmd_pos, n, cell, ct) == 0:
+            return (n / length if length else 1.0), n
+        k += 1
+
+    # 命令点比格还密, 实在排不下 -> 用音符选的格宽, 由铺格那步按 round() 落格。
+    return d0, n0
 
 
 def timing_cuts(timing: Timing):
@@ -938,6 +1283,8 @@ def convert(src: str, dst: str, encoding: str = 'cp932', course_opt=None,
         carry = carry_next
 
         # ---- 小节内部的命令分段: [(起始格, scroll, kiai), ...] ----
+        # ⚠ 同一格的多条命令只有最后一条存活, 前一条被覆盖 = 它影响的音符用错流速。
+        #   所以档位选择那一步 (_cmd_collapse) 会尽力保证命令点各占一格。
         segs = []
         for t, sv, kiai in [(b['start'], b['scroll'], b['kiai'])] + list(b['cuts']):
             i = int(round((t - b['start']) / b['msb'] / cell))
